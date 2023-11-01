@@ -17,6 +17,10 @@ from lms.djangoapps.grades import api as grades_api
 from opaque_keys.edx.keys import CourseKey, UsageKey
 from openedx.core.djangoapps.course_groups.cohorts import get_cohort
 from super_csv.csv_processor import CSVProcessor, DeferrableMixin, ValidationError
+from openedx.core.djangoapps.content.course_overviews.models import CourseOverview
+from common.djangoapps.student.models import CourseEnrollment
+from lms.djangoapps.grades.models import PersistentCourseGrade
+from lms.djangoapps.certificates.models import GeneratedCertificate
 
 from bulk_grades.clients import LearnerAPIClient
 
@@ -28,6 +32,15 @@ log = logging.getLogger(__name__)
 
 UNKNOWN_LAST_SCORE_OVERRIDER = 'unknown'
 
+
+def format_date(type, obj_date):
+    from datetime import datetime
+    if type == 'certificate':
+        input_format = "%Y-%m-%d %H:%M:%S.%f%z"    
+    input_format = "%Y-%m-%d %H:%M:%S.%f%z"
+    datetime_obj = datetime.strptime(obj_date, input_format)
+    formatted_date = datetime_obj.strftime("%Y-%m-%d %H:%M:%S")
+    return formatted_date
 
 def _get_enrollments(course_id, track=None, cohort=None, active_only=False, excluded_course_roles=None):
     """
@@ -66,6 +79,7 @@ def _get_enrollments(course_id, track=None, cohort=None, active_only=False, excl
         enrollments = enrollments.exclude(has_excluded_course_role=True)
 
     for enrollment in enrollments:
+        ## added course id for processing data from persistence grade
         enrollment_dict = {
             'user': enrollment.user,
             'user_id': enrollment.user.id,
@@ -73,6 +87,7 @@ def _get_enrollments(course_id, track=None, cohort=None, active_only=False, excl
             'full_name': enrollment.user.profile.name,
             'enrolled': enrollment.is_active,
             'track': enrollment.mode,
+            'course_id': enrollment.course_id
         }
         program_course_enrollment = enrollment.programcourseenrollment_set.all()
         if program_course_enrollment.exists():
@@ -285,7 +300,7 @@ class GradeCSVProcessor(DeferrableMixin, GradedSubsectionMixin, CSVProcessor):
         Create GradeCSVProcessor.
         """
         # First, set some default values.
-        self.columns = ['user_id', 'username', 'student_key', 'course_id', 'track', 'cohort']
+        self.columns = ['user_id', 'username', 'student_key', 'course_id', 'track', 'cohort', 'passed_date', 'certificate_assigned', 'enrollment_date']
         self.course_id = None
         self.subsection_grade_max = None
         self.subsection_grade_min = None
@@ -362,6 +377,7 @@ class GradeCSVProcessor(DeferrableMixin, GradedSubsectionMixin, CSVProcessor):
         operation = {}
         user_id = row['user_id']
         if user_id in self._users_seen:
+            
             if len(self._users_seen[user_id]) == 1:
                 self.add_error(_('Repeated user_id: ') + str(user_id), self._users_seen[user_id][0])
             self._users_seen[user_id].append(self._row_num)
@@ -411,6 +427,7 @@ class GradeCSVProcessor(DeferrableMixin, GradedSubsectionMixin, CSVProcessor):
         """
         Return iterator of rows to export.
         """
+        
         enrollments = list(_get_enrollments(
             self._course_key,
             track=self.track,
@@ -419,11 +436,43 @@ class GradeCSVProcessor(DeferrableMixin, GradedSubsectionMixin, CSVProcessor):
             excluded_course_roles=self.excluded_course_roles,
         ))
         enrolled_users = [enroll['user'] for enroll in enrollments]
+        course_ids = [str(id['course_id']) for id in enrollments]
+        final_list = []    
+        for item1, item2 in zip(enrolled_users, course_ids):
+            item_dict = {}
+            try:
+                data = PersistentCourseGrade.objects.get(course_id=item2, user_id=item1.id)
+                item_dict.update({'user_id' : item1.id,
+                                  'course_id': item2,
+                                  'passed_date':data.passed_timestamp})
+                final_list.append(item_dict)
+            except Exception as err:
+                pass
 
         grades_api.prefetch_course_and_subsection_grades(self._course_key, enrolled_users)
-
+        
         for enrollment in enrollments:
             cohort = get_cohort(enrollment['user'], self._course_key, assign=False)
+            passed_date = None
+            try:
+                parts = [item['passed_date'] for item in final_list if item['user_id'] == enrollment['user_id'] and item['course_id'] == str(enrollment['course_id'])]
+                if parts:
+                    passed_date = format_date("persistentgrade", str(parts[0]))
+            except Exception as err:
+                pass
+            try:
+                gc = GeneratedCertificate.objects.get(user=enrollment['user_id'], course_id=enrollment['course_id'])
+                if gc:
+                    certificate_assigned = format_date("certificate", str(gc.created_date))
+            except Exception as err:
+                certificate_assigned = None
+            course_overview = CourseOverview.objects.get(id=str(enrollment['course_id']))
+            try:
+                enrollment_date_assigned = CourseEnrollment.objects.get(user=enrollment['user_id'], course=course_overview, is_active=True)
+                enrollment_date = format_date("enrollment", str(enrollment_date_assigned.created))
+            except Exception as err:
+                enrollment_date = None
+
             row = {
                 'user_id': enrollment['user_id'],
                 'username': enrollment['username'],
@@ -431,7 +480,11 @@ class GradeCSVProcessor(DeferrableMixin, GradedSubsectionMixin, CSVProcessor):
                 'track': enrollment['track'],
                 'course_id': self.course_id,
                 'cohort': cohort.name if cohort else None,
+                'passed_date': passed_date, 
+                'certificate_assigned': certificate_assigned, 
+                'enrollment_date': enrollment_date
             }
+            
             grades = grades_api.get_subsection_grades(enrollment['user_id'], self._course_key)
             if self._subsection and (self.subsection_grade_max or self.subsection_grade_min):
                 short_id = self._subsection.block_id[:8]
@@ -500,7 +553,6 @@ class GradeCSVProcessor(DeferrableMixin, GradedSubsectionMixin, CSVProcessor):
         columns = self.columns.copy()
         for unmodified_column in self._subsection_column_names(unmodified_subsections, self.subsection_prefixes):
             columns.remove(unmodified_column)
-
         return columns
 
 
